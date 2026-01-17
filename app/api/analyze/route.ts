@@ -1,5 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { NextResponse } from "next/server";
+import { createClient } from "@/lib/supabase/server";
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
@@ -34,6 +35,8 @@ const SYSTEM_PROMPT = `You are an expert PM Resume Optimizer. Analyze the resume
 Return ONLY the JSON object. No markdown, no explanation.`;
 
 export async function POST(request: Request) {
+  const startTime = Date.now();
+  
   try {
     const { resumeText, jobDescription } = await request.json();
 
@@ -44,6 +47,18 @@ export async function POST(request: Request) {
       );
     }
 
+    // Get user session
+    const supabase = await createClient();
+    const { data: { user } } = await supabase.auth.getUser();
+
+    if (!user) {
+      return NextResponse.json(
+        { error: "Unauthorized" },
+        { status: 401 }
+      );
+    }
+
+    // Call Claude API
     const message = await anthropic.messages.create({
       model: "claude-sonnet-4-5-20250929",
       max_tokens: 4096,
@@ -61,6 +76,7 @@ export async function POST(request: Request) {
       throw new Error("Unexpected response format");
     }
 
+    // Parse JSON response
     let analysis;
     const jsonMatch = content.text.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
@@ -69,7 +85,36 @@ export async function POST(request: Request) {
       analysis = JSON.parse(content.text);
     }
 
-    return NextResponse.json(analysis);
+    const processingTime = Date.now() - startTime;
+
+    // Save to Supabase
+    const { data: savedAnalysis, error: saveError } = await supabase
+      .from("analyses")
+      .insert({
+        user_id: user.id,
+        original_resume_text: resumeText,
+        job_description: jobDescription,
+        target_company: analysis.jd_analysis?.company || null,
+        target_role: analysis.jd_analysis?.role || null,
+        jd_analysis: analysis.jd_analysis,
+        gap_analysis: analysis.gap_analysis,
+        improvements: analysis.improvements,
+        optimized_resume: analysis.optimized_resume,
+        status: "completed",
+        processing_time_ms: processingTime,
+      })
+      .select()
+      .single();
+
+    if (saveError) {
+      console.error("Supabase save error:", saveError);
+      // Still return analysis even if save fails
+    }
+
+    return NextResponse.json({
+      ...analysis,
+      id: savedAnalysis?.id,
+    });
   } catch (error) {
     console.error("Analysis error:", error);
     return NextResponse.json(
